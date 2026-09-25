@@ -1,0 +1,33 @@
+[Unit]
+Description=RadeonPilot GPU control daemon
+Documentation=https://github.com/gomaes/radeonpilot
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+# Waits up to 30 s for GPUs that have a boot profile, then applies it.
+# -P: never import from the working directory (safe path).
+ExecStart=/opt/radeonpilot/venv/bin/python -P -m radeonpilot.daemon
+WorkingDirectory=/opt/radeonpilot
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Hardening. /sys must stay writable, so ProtectKernelTunables= is NOT used.
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=-/etc/radeonpilot
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

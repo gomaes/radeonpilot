@@ -9,11 +9,16 @@ py="${PYTHON:-python3}"
 
 work="$(mktemp -d -t radeonpilot-emu.XXXXXX)"
 daemon_pid=""
+gui_pid=""
 cleanup() {
-    [[ -n "$daemon_pid" ]] && kill "$daemon_pid" 2>/dev/null || true
+    local pid
+    for pid in $gui_pid $daemon_pid; do kill "$pid" 2>/dev/null || true; done
+    wait 2>/dev/null || true
     rm -rf "$work"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 cd "$here"
 "$py" -m radeonpilot.emulator build "$work/sysfs" "$@"
@@ -28,4 +33,6 @@ daemon_pid=$!
 for _ in $(seq 50); do [[ -S "$RADEONPILOT_SOCKET" ]] && break; sleep 0.1; done
 
 echo "emulated sysfs: $RADEONPILOT_SYSFS_ROOT"
-"$py" -m radeonpilot
+"$py" -m radeonpilot &
+gui_pid=$!
+wait "$gui_pid" || true
