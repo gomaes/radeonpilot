@@ -1,4 +1,4 @@
-"""Top-level window: one tab per detected amdgpu device."""
+"""Top-level window: one tab per detected amdgpu device plus the launcher."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from .. import __version__
 from ..protocol import DaemonClient
 from ..sysfs import discover_gpus, read_stats
 from .control_tab import ControlTab
+from .launcher_tab import LauncherTab
 from .monitor_tab import MonitorTab
 
 POLL_INTERVAL_MS = 1000
@@ -53,6 +54,10 @@ class MainWindow(QMainWindow):
             self.controls.append(ctrl)
             self.tabs.addTab(page, f"{gpu.card}: {gpu.name}")
             self.tabs.setTabToolTip(self.tabs.count() - 1, f"{gpu.pci_address}  [{gpu.vk_device_select}]")
+
+        self.launcher = LauncherTab(self.gpus)
+        self.launcher.status_message.connect(self.show_status)
+        self.tabs.addTab(self.launcher, "ランチャー")
 
         self.daemon_label = QLabel()
         self.statusBar().addPermanentWidget(self.daemon_label)
