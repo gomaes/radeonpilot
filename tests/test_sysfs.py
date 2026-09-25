@@ -1,14 +1,10 @@
-from pathlib import Path
+import os
 
 import pytest
 
 from radeonpilot import sysfs
-from tests.fake_sysfs import add_gpu, build_default
-
-
-@pytest.fixture
-def root(tmp_path: Path) -> Path:
-    return build_default(tmp_path)
+from radeonpilot.emulator import build_tree
+from tests.conftest import RX7900XTX, RX9070XT
 
 
 def test_parse_dpm_clock():
@@ -18,44 +14,43 @@ def test_parse_dpm_clock():
     assert sysfs.parse_dpm_clock("S: 19Mhz *\n0: 500Mhz\n") == 19
 
 
-def test_discover(root):
-    gpus = sysfs.discover_gpus(root)
-    assert [g.card for g in gpus] == ["card0", "card1"]
-    g = gpus[0]
-    assert g.pci_address == "0000:03:00.0"
-    assert g.name == "AMD Radeon RX 9070 XT"
-    assert g.dri_prime_id == "pci-0000_03_00_0"
-    assert g.vk_device_select == "1002:7550"
-    assert gpus[1].name  # product_name missing: pci.ids lookup or fallback
-    assert gpus[1].hwmon_path is None
+def test_discover(emu_root):
+    gpus = sysfs.discover_gpus(emu_root)
+    assert [(g.card, g.pci_address) for g in gpus] == [("card1", RX9070XT), ("card2", RX7900XTX)]
+    rdna4, rdna3 = gpus
+    assert rdna4.name == "AMD Radeon RX 9070 XT"
+    assert rdna3.name == "AMD Radeon RX 7900 XTX"
+    assert rdna4.dri_prime_id == "pci-0000_03_00_0"
+    assert rdna4.vk_device_select == "1002:7550"
+    assert rdna3.vk_device_select == "1002:744c"
+    assert rdna4.hwmon_path.name == "hwmon2"
 
 
 def test_non_amd_ignored(tmp_path):
-    add_gpu(tmp_path, 0, "0000:01:00.0", 0x2684, vendor=0x10DE)
-    assert sysfs.discover_gpus(tmp_path) == []
+    root = build_tree(tmp_path, gpus=())
+    dev = root / "sys/devices/pci0000:00/0000:01:00.0"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x10de\n")
+    (dev / "device").write_text("0x2684\n")
+    (root / "sys/class/drm/card3").mkdir()
+    os.symlink(dev, root / "sys/class/drm/card3/device")
+    assert sysfs.discover_gpus(root) == []
 
 
-def test_read_stats(root):
-    g = sysfs.discover_gpus(root)[0]
+def test_read_stats(emu_root):
+    for g in sysfs.discover_gpus(emu_root):
+        s = sysfs.read_stats(g)
+        assert s.sclk_mhz and s.mclk_mhz
+        assert s.power_w is not None and s.power_w > 0  # 9070 XT: power1_input, 7900 XTX: power1_average
+        assert s.power_cap_w in (304, 339)
+        assert s.busy_percent is not None
+        assert 0 < s.vram_percent < 100
+        assert s.fan_rpm is not None
+        assert set(s.temps_c) == {"edge", "junction", "mem"}
+
+
+def test_stats_without_hwmon(emu_root):
+    g = sysfs.discover_gpus(emu_root)[0]
+    g.hwmon_path = None
     s = sysfs.read_stats(g)
-    assert s.sclk_mhz == 2310
-    assert s.mclk_mhz == 1250
-    assert s.power_w == pytest.approx(245.0)
-    assert s.power_cap_w == pytest.approx(263.0)
-    assert s.busy_percent == 87
-    assert s.vram_percent == pytest.approx(37.5)
-    assert s.fan_rpm == 1450
-    assert s.temps_c == {"edge": 62.0, "junction": 78.0, "mem": 70.0}
-
-
-def test_power_input_fallback(root):
-    g = sysfs.discover_gpus(root)[0]
-    (g.hwmon_path / "power1_average").unlink()
-    (g.hwmon_path / "power1_input").write_text("12000000\n")
-    assert sysfs.read_stats(g).power_w == pytest.approx(12.0)
-
-
-def test_stats_without_hwmon(root):
-    g = sysfs.discover_gpus(root)[1]
-    s = sysfs.read_stats(g)
-    assert s.power_w is None and s.temps_c == {} and s.sclk_mhz == 2310
+    assert s.power_w is None and s.temps_c == {} and s.sclk_mhz

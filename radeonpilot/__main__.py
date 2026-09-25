@@ -37,13 +37,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.dump:
         return dump()
 
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
-    from .gui.main_window import MainWindow
+    from .gui.main_window import ICON_PATH, MainWindow
 
     app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName("RadeonPilot")
     app.setDesktopFileName("radeonpilot")
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = MainWindow()
     window.show()
     return app.exec()

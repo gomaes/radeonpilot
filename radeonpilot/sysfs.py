@@ -22,6 +22,25 @@ PCI_IDS_PATHS = (
     "/usr/share/pci.ids",
 )
 
+# Exact retail names keyed by (device id, PCI revision). Checked before pci.ids
+# because pci.ids only lists the shared chip name (e.g. "Navi 31 [...]").
+KNOWN_MODELS = {
+    (0x744C, 0xC8): "AMD Radeon RX 7900 XTX",
+    (0x744C, 0xCC): "AMD Radeon RX 7900 XT",
+    (0x7550, 0xC0): "AMD Radeon RX 9070 XT",
+    (0x7550, 0xC3): "AMD Radeon RX 9070",
+}
+
+# Chip names used when pci.ids is not installed.
+KNOWN_CHIPS = {
+    0x744C: "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE]",
+    0x7448: "Navi 31 [Radeon Pro W7900]",
+    0x747E: "Navi 32 [Radeon RX 7700 XT/7800 XT]",
+    0x7480: "Navi 33 [Radeon RX 7600/7600 XT]",
+    0x7550: "Navi 48 [Radeon RX 9070/9070 XT/9070 GRE]",
+    0x7590: "Navi 44 [Radeon RX 9060 XT]",
+}
+
 _CARD_RE = re.compile(r"^card(\d+)$")
 _DPM_LINE_RE = re.compile(r"^\s*(\w+):\s*(\d+)\s*[Mm][Hh]z\s*(\*)?")
 
@@ -162,10 +181,13 @@ def _find_hwmon(device_path: Path) -> Path | None:
 
 
 def _gpu_name(device_path: Path, vendor: int, device: int) -> str:
-    # Some kernels expose a marketing name directly.
+    # Some boards expose a marketing name directly (read from the FRU EEPROM).
     name = read_text(device_path / "product_name")
     if name:
         return name
+    revision = read_int(device_path / "revision")
+    if (device, revision) in KNOWN_MODELS:
+        return KNOWN_MODELS[(device, revision)]
     name = _lookup_pci_name(
         vendor,
         device,
@@ -174,6 +196,8 @@ def _gpu_name(device_path: Path, vendor: int, device: int) -> str:
     )
     if name:
         return name
+    if device in KNOWN_CHIPS:
+        return KNOWN_CHIPS[device]
     return f"AMD GPU [{vendor:04x}:{device:04x}]"
 
 
