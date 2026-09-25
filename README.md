@@ -16,6 +16,17 @@ AMD RDNA3 / RDNA4 GPU 向けの Linux 用 GUI 管理ツール（PySide6 / Qt6）
 - GUI（一般ユーザー権限）: sysfs を直接読み取って監視
 - デーモン（root, systemd）: `/run/radeonpilot.sock`（グループ `radeonpilot` のみアクセス可）で JSON メッセージを受け、検証後に sysfs へ書き込み
 
+## 開発版の実行（インストーラー完成前）
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m radeonpilot          # GUI
+.venv/bin/python -m radeonpilot --dump   # GUIなしで検出結果と現在値を表示
+```
+
+テスト: `.venv/bin/pip install pytest && .venv/bin/python -m pytest`
+
 ## ライセンス
 
 MIT
