@@ -1,9 +1,15 @@
 """Software power limiter for targets below the driver's power1_cap_min.
 
 The kernel rejects power caps below power1_cap_min, so for lower targets the
-hardware cap stays at that minimum and this loop lowers the core clock
-ceiling (RDNA3: OD sclk_max, RDNA4: OD sclk_offset) while the measured power
-is above the target, and gives it back when there is headroom.
+hardware cap stays at that minimum and this loop lowers clocks while the
+measured power is above the target, and gives them back when there is
+headroom. Two stages:
+
+1. core clock ceiling (RDNA3: OD sclk_max, RDNA4: OD sclk_offset) - always;
+2. memory clock ceiling (OD mclk_max, stepping through the real DPM levels) -
+   only if the user opted in, and only once the core is at its floor.
+
+Clocks are given back in reverse order (memory first).
 
 It is written so that it never keeps an idle GPU awake:
 
@@ -40,6 +46,11 @@ UNDER = 0.92  # give clocks back when power < target * UNDER
 RAISE_STEP_MHZ = 50
 MIN_STEP_MHZ = 25
 MAX_STEP_MHZ = 200
+# Memory steps are coarse (a whole DPM level), so it takes more headroom and a
+# hold time before one is given back - otherwise it would oscillate.
+MEM_UNDER = 0.82
+MEM_HOLD_S = 10.0
+MEM_KEY = "mclk_max"
 
 
 @dataclass
@@ -54,6 +65,15 @@ class LimitState:
     idle_samples: int = 0
     last_power_w: float | None = None
     status: str = "starting"  # starting / sleeping / idle / ok / limiting / floor
+    # Memory stage (None = not allowed: memory stays at the user's value).
+    mem_levels: list[int] | None = None  # usable mclk_max values, ascending, floor first
+    mem_base: int = 0
+    mem_current: int = 0
+    mem_lowered_at: float = float("-inf")
+
+    @property
+    def mem_floor(self) -> int | None:
+        return self.mem_levels[0] if self.mem_levels else None
 
     def to_dict(self) -> dict:
         return {
@@ -64,7 +84,28 @@ class LimitState:
             "floor": self.floor,
             "status": self.status,
             "last_power_w": self.last_power_w,
+            # Every allowed stage is at its floor: nothing more can be lowered.
+            "at_floor": self.current <= self.floor
+            and (self.mem_levels is None or self.mem_current <= self.mem_floor),
+            "memory": None
+            if self.mem_levels is None
+            else {"base": self.mem_base, "current": self.mem_current, "floor": self.mem_floor},
         }
+
+
+def memory_levels(dpm_levels: list[int], base: int, mclk_min: int | None) -> list[int]:
+    """mclk_max values the memory stage may use: real DPM levels between the floor and base.
+
+    The floor is the second-lowest DPM level (the lowest one is the idle state),
+    and never below the user's mclk_min.
+    """
+    levels = sorted(set(dpm_levels))
+    if not levels:
+        return [base]
+    floor = levels[1] if len(levels) > 2 else levels[0]
+    floor = max(floor, mclk_min or 0)
+    usable = [lv for lv in levels if floor <= lv < base]
+    return usable + [base]
 
 
 def next_value(st: LimitState, power_w: float, busy_percent: int = 100) -> int:
@@ -78,6 +119,28 @@ def next_value(st: LimitState, power_w: float, busy_percent: int = 100) -> int:
     if power_w < target_w * UNDER and st.current < st.base and busy_percent >= RAISE_BUSY_PERCENT:
         return min(st.base, st.current + RAISE_STEP_MHZ)
     return st.current
+
+
+def decide(st: LimitState, power_w: float, busy_percent: int, now: float) -> tuple[str, int] | None:
+    """Pick the next (OD key, value) to write, or None."""
+    target_w = st.target_uw / 1_000_000
+    if power_w > target_w * OVER:
+        if st.current > st.floor:
+            return st.key, next_value(st, power_w, busy_percent)
+        if st.mem_levels and st.mem_current > st.mem_floor:
+            lower = [lv for lv in st.mem_levels if lv < st.mem_current]
+            return MEM_KEY, lower[-1]
+        return None
+    if busy_percent < RAISE_BUSY_PERCENT:
+        return None
+    if st.mem_levels and st.mem_current < st.mem_base:
+        # Memory is given back first; the core stays at its floor until then.
+        if power_w < target_w * MEM_UNDER and now - st.mem_lowered_at >= MEM_HOLD_S:
+            higher = [lv for lv in st.mem_levels if lv > st.mem_current]
+            return MEM_KEY, higher[0]
+        return None
+    new = next_value(st, power_w, busy_percent)
+    return (st.key, new) if new != st.current else None
 
 
 class SoftPowerLimiter:
@@ -157,12 +220,20 @@ class SoftPowerLimiter:
             return
         st.idle_samples = 0
         st.next_sample = now + TICK_S
-        new = next_value(st, power, busy)
+        step = decide(st, power, busy, now)
         over = power > target_w * OVER
-        st.status = "floor" if over and new == st.floor == st.current else ("limiting" if st.current < st.base or over else "ok")
-        if new == st.current or now - st.last_write < MIN_WRITE_INTERVAL_S:
+        lowered = st.current < st.base or (st.mem_levels is not None and st.mem_current < st.mem_base)
+        st.status = "floor" if over and step is None else ("limiting" if lowered or over else "ok")
+        if step is None or now - st.last_write < MIN_WRITE_INTERVAL_S:
             return
-        log.debug("%s: %.0f W (target %.0f W): %s %d -> %d", gpu.pci_address, power, target_w, st.key, st.current, new)
-        if self.controller.limiter_write(gpu, st.key, new):
-            st.current = new
+        key, value = step
+        old = st.mem_current if key == MEM_KEY else st.current
+        log.debug("%s: %.0f W (target %.0f W): %s %d -> %d", gpu.pci_address, power, target_w, key, old, value)
+        if self.controller.limiter_write(gpu, key, value):
+            if key == MEM_KEY:
+                if value < st.mem_current:
+                    st.mem_lowered_at = now
+                st.mem_current = value
+            else:
+                st.current = value
             st.last_write = now

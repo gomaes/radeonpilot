@@ -59,6 +59,7 @@ SOFT_LIMIT_TEXT = (
     "・ハードウェアの電力上限はドライバの下限 {min_w:g} W に設定します。\n"
     "・デーモンが消費電力を監視し、{target} を自動で下げて {watts} W に近づけます"
     "（ソフトウェア制限・実験的）。\n"
+    "・{memory}\n"
     "・負荷が急に増えると、数秒間は目標を超えることがあります。\n"
     "・クロックを下限まで下げても目標に届かない場合は、状態欄に表示します。\n"
     "・GPU がアイドル/スリープ中は読み書きしません（深いアイドルを妨げません）。\n"
@@ -104,7 +105,8 @@ def describe_settings(settings: dict) -> str:
     if "power_cap_w" in settings:
         lines.append(f"電力上限: {settings['power_cap_w']} W")
     if "power_target_w" in settings:
-        lines.append(f"電力目標: {settings['power_target_w']:g} W（ソフトウェア制限）")
+        mem = "、メモリクロック削減あり" if settings.get("power_target_allow_memory") else ""
+        lines.append(f"電力目標: {settings['power_target_w']:g} W（ソフトウェア制限{mem}）")
     for key, value in (settings.get("od") or {}).items():
         if key in OD_FIELDS:
             lines.append(f"{OD_FIELDS[key][1]}: {value} {OD_FIELDS[key][2]}")
@@ -185,8 +187,12 @@ class ControlTab(QWidget):
         self.power_info.setWordWrap(True)
         self.soft_status = QLabel()
         self.soft_status.setWordWrap(True)
+        self.mem_stage_check = QCheckBox(
+            "目標に届かないときはメモリクロックも下げる（性能が大きく落ちるため既定はオフ。オフならメモリは定格のまま）"
+        )
         pl.addLayout(row)
         pl.addLayout(preset_row)
+        pl.addWidget(self.mem_stage_check)
         pl.addWidget(self.power_info)
         pl.addWidget(self.soft_status)
         layout.addWidget(self.power_box)
@@ -346,6 +352,8 @@ class ControlTab(QWidget):
             return
         lo, hi, soft = self._power_bounds(st)
         value = self.soft_limit["target_w"] if self.soft_limit else (p.current_w or p.min_w)
+        self.mem_stage_check.setChecked(bool(self.soft_limit and self.soft_limit.get("memory")))
+        self.mem_stage_check.setEnabled(soft and bool(st.od) and "mclk_max" in st.od.supported())
         for w in (self.power_slider, self.power_spin):
             w.blockSignals(True)
             w.setRange(lo, hi)
@@ -377,12 +385,21 @@ class ControlTab(QWidget):
             self.soft_status.setText("")
             return
         text = f"ソフトウェア制限: 目標 {sl['target_w']:g} W — {LIMIT_STATUS.get(sl['status'], sl['status'])}"
-        unit = "MHz"
         name = "コアクロック上限" if sl["key"] == "sclk_max" else "コアクロック オフセット"
+        parts = []
         if sl["current"] != sl["base"]:
-            text += f"（{name} {sl['current']} {unit}、設定値 {sl['base']} {unit}、下限 {sl['floor']} {unit}）"
-        if sl.get("last_power_w") is not None and sl["status"] not in ("sleeping",):
+            parts.append(f"{name} {sl['current']} MHz（設定値 {sl['base']}、下限 {sl['floor']}）")
+        mem = sl.get("memory")
+        if mem and mem["current"] != mem["base"]:
+            parts.append(f"メモリクロック上限 {mem['current']} MHz（設定値 {mem['base']}、下限 {mem['floor']}）")
+        if parts:
+            text += "\n" + "、".join(parts)
+        if sl.get("last_power_w") is not None and sl["status"] != "sleeping":
             text += f"　直近の消費電力: {sl['last_power_w']:.0f} W"
+        if sl.get("at_floor") and sl["status"] in ("limiting", "floor"):
+            text += "\n⚠ 許可された範囲でクロックを下げきりました。負荷によっては目標を超えます。"
+            if mem is None:
+                text += "（メモリクロックの削減を許可すると、さらに下げられる場合があります）"
         self.soft_status.setText(text)
 
     def _poll_limiter(self) -> None:
@@ -542,10 +559,18 @@ class ControlTab(QWidget):
         if p is not None and p.min_w is not None and watts < p.min_w:
             key = control.sclk_limit_key(self.state.od)
             target = "コアクロック上限" if key == "sclk_max" else "コアクロック オフセット"
+            allow_memory = self.mem_stage_check.isChecked() and self.mem_stage_check.isEnabled()
+            memory = (
+                "コアクロックを下限まで下げても目標を超える場合は、メモリクロック上限も DPM レベル単位で下げます"
+                "（性能が大きく落ちます）。"
+                if allow_memory
+                else "メモリクロックは定格のまま変更しません。"
+            )
             if not self._confirm("ソフトウェア電力制限の確認",
-                                 SOFT_LIMIT_TEXT.format(watts=watts, min_w=p.min_w, target=target)):
+                                 SOFT_LIMIT_TEXT.format(watts=watts, min_w=p.min_w, target=target, memory=memory)):
                 return
-            self._call("set_power_target", f"電力目標を {watts} W に設定しました（ソフトウェア制限）", watts=watts)
+            self._call("set_power_target", f"電力目標を {watts} W に設定しました（ソフトウェア制限）",
+                       watts=watts, allow_memory=allow_memory)
         else:
             self._call("set_power_target", f"電力上限を {watts} W に設定しました", watts=watts)
 

@@ -193,3 +193,93 @@ def test_no_clock_raise_under_light_load():
     assert limiter_mod.next_value(st, 260.0, busy_percent=95) < 1800   # over target: lower
     st.current = 500
     assert limiter_mod.next_value(st, 260.0) == 500                    # never below the floor
+
+
+# ---------------------------------------------------------------- memory stage
+
+def test_memory_levels():
+    assert limiter_mod.memory_levels([96, 456, 772, 1258], 1258, 97) == [456, 772, 1258]
+    assert limiter_mod.memory_levels([96, 456, 772, 1258], 1000, 97) == [456, 772, 1000]
+    assert limiter_mod.memory_levels([96, 456, 772, 1258], 1258, 800) == [1258]  # user's mclk_min wins
+    assert limiter_mod.memory_levels([], 1258, 97) == [1258]
+
+
+def _mem_state(**kw):
+    st = limiter_mod.LimitState(target_uw=180_000_000, key="sclk_offset", base=0, current=-500, floor=-500,
+                                mem_levels=[456, 772, 1258], mem_base=1258, mem_current=1258)
+    for k, v in kw.items():
+        setattr(st, k, v)
+    return st
+
+
+def test_decide_order():
+    # Core first while it has room.
+    assert limiter_mod.decide(_mem_state(current=-200), 230, 95, 0)[0] == "sclk_offset"
+    # Core at floor: memory one DPM level down.
+    assert limiter_mod.decide(_mem_state(), 230, 95, 0) == ("mclk_max", 772)
+    # Everything at floor: nothing to do.
+    assert limiter_mod.decide(_mem_state(mem_current=456), 230, 95, 0) is None
+    # Headroom: memory back first, only with enough margin and after the hold time.
+    st = _mem_state(mem_current=772, mem_lowered_at=100.0)
+    assert limiter_mod.decide(st, 140, 95, 105) is None               # hold time not over
+    assert limiter_mod.decide(st, 160, 95, 120) is None               # 160 > 180 * 0.82
+    assert limiter_mod.decide(st, 140, 95, 120) == ("mclk_max", 1258)
+    assert limiter_mod.decide(st, 140, 40, 120) is None               # light load: keep
+    # Memory back at base: then the core.
+    assert limiter_mod.decide(_mem_state(), 150, 95, 0) == ("sclk_offset", -450)
+
+
+def test_memory_stays_at_stock_by_default(controller, backend, clock):
+    controller.set_power_target(RX9070XT, 150)
+    run(controller, backend, clock, 120)
+    assert not [t for a, t in backend.writes if a == "pp_od_clk_voltage" and t.startswith("m ")]
+    lim = controller.limiter.get(RX9070XT).to_dict()
+    assert lim["memory"] is None and lim["current"] == -500 and lim["at_floor"]
+
+
+def test_memory_stage_opt_in(controller, backend, clock):
+    st = controller.set_power_target(RX9070XT, 150, allow_memory=True)
+    assert st["soft_limit"]["memory"] == {"base": 1258, "current": 1258, "floor": 456}
+    run(controller, backend, clock, 120)
+    mem_writes = [int(t.split()[2]) for a, t in backend.writes if a == "pp_od_clk_voltage" and t.startswith("m 1 ")]
+    assert mem_writes and set(mem_writes) <= {456, 772, 1258}  # real DPM levels only
+    first_mem = next(i for i, (a, t) in enumerate(backend.writes) if t.startswith("m 1 "))
+    core_before = [t for a, t in backend.writes[:first_mem] if t.startswith("s ")]
+    assert core_before[-1] == "s -500"  # memory only after the core hit its floor
+    assert controller.state(RX9070XT)["od"]["values"]["mclk_max"] == 1258  # user's value shown
+    controller.set_power_target(RX9070XT, 300)  # back in range: everything restored
+    od = control.parse_od((next(g for g in controller.discover() if g.pci_address == RX9070XT).device_path
+                           / "pp_od_clk_voltage").read_text())
+    assert od.values["mclk_max"] == 1258 and od.values["sclk_offset"] == 0
+
+
+def test_memory_opt_in_profile_and_validation(controller, backend, clock):
+    with pytest.raises(ValidationError):
+        controller.set_power_target(RX9070XT, 150, allow_memory="yes")
+    controller.set_power_target(RX9070XT, 150, allow_memory=True)
+    run(controller, backend, clock, 60)
+    controller.save_profile(RX9070XT, "p")
+    prof = controller.list_profiles(RX9070XT)["profiles"]["p"]
+    assert prof["power_target_allow_memory"] is True and prof["od"]["mclk_max"] == 1258
+    controller.reset(RX9070XT)
+    st = controller.apply_profile(RX9070XT, "p")
+    assert st["soft_limit"]["memory"] is not None
+
+
+def test_turning_memory_stage_off_gives_memory_back(controller, backend, clock):
+    controller.set_power_target(RX9070XT, 150, allow_memory=True)
+    run(controller, backend, clock, 120)
+    assert controller.limiter.get(RX9070XT).mem_current < 1258
+    controller.set_power_target(RX9070XT, 150, allow_memory=False)
+    od = control.parse_od((next(g for g in controller.discover() if g.pci_address == RX9070XT).device_path
+                           / "pp_od_clk_voltage").read_text())
+    assert od.values["mclk_max"] == 1258 and controller.limiter.get(RX9070XT).mem_levels is None
+
+
+def test_rdna3_reaches_150_with_core_only(controller, backend, clock):
+    controller.set_power_target(RX7900XTX, 150)
+    samples = run(controller, backend, clock, 200)
+    busy = [s[RX7900XTX].power_w for s in samples[-100:]
+            if not s[RX7900XTX].asleep and s[RX7900XTX].busy_percent > 90]
+    assert busy and sum(busy) / len(busy) < 150 * 1.05
+    assert not [t for a, t in backend.writes if t.startswith("m ")]

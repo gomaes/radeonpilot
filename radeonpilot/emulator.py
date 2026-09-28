@@ -49,6 +49,7 @@ SPECS = {
         "power_min": 274,
         "power_max": 334,
         "power_idle": 14,
+        "power_mem": 35,  # memory subsystem at full memory clock under load
         "power_attr": "power1_input",
         "runtime_pm": False,  # drives the display: never runtime-suspends
         "fan_max_rpm": 3300,
@@ -74,6 +75,7 @@ SPECS = {
         "power_min": 305,
         "power_max": 390,
         "power_idle": 22,
+        "power_mem": 45,
         "power_attr": "power1_average",
         "runtime_pm": True,  # secondary card: suspends after 5 s idle
         "fan_max_rpm": 3200,
@@ -458,9 +460,11 @@ class Simulator:
             mclk = m_levels[0]
 
         idle = spec["power_idle"]
+        mem_full = spec["power_mem"]
         # Dynamic power grows much faster than linearly with clock (voltage rises too).
         scale = (sclk / spec["sclk_boost"]) ** 2.2 * (1 + od.get("voltage_offset", 0) / 600)
-        demand = idle + load * (spec["power_default"] * 1.15 - idle) * scale
+        mem_power = mem_full * (mclk / spec["mclk_levels"][-1]) * (0.3 + 0.7 * load)
+        demand = idle + load * (spec["power_default"] * 1.15 - idle - mem_full) * scale + mem_power
         cap = state["power_cap_uw"] / 1_000_000
         power = min(demand, cap)
         if demand > cap:  # power limited: clocks drop

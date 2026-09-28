@@ -271,3 +271,17 @@ def test_only_visible_gpu_is_polled(window, monkeypatch):
     window.pages[0].setCurrentIndex(0)
     window.refresh()
     assert polled == [RX9070XT]
+
+
+def test_memory_stage_checkbox(window, controller, dialogs):
+    c = ctrl_for(window, RX9070XT)
+    assert not c.mem_stage_check.isChecked() and c.mem_stage_check.isEnabled()
+    c.power_spin.setValue(150)
+    c.apply_power()
+    assert "メモリクロックは定格のまま" in dialogs[-1][2]
+    assert controller.state(RX9070XT)["soft_limit"]["memory"] is None
+    c.mem_stage_check.setChecked(True)
+    c.apply_power()
+    assert "メモリクロック上限も" in dialogs[-1][2]
+    assert controller.state(RX9070XT)["soft_limit"]["memory"]["floor"] == 456
+    assert c.mem_stage_check.isChecked()  # reflects the daemon state after refresh

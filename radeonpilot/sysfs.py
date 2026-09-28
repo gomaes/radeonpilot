@@ -66,6 +66,16 @@ def read_int(path: Path) -> int | None:
         return None
 
 
+def parse_dpm_levels(text: str | None) -> list[int]:
+    """All numbered levels (MHz) of a pp_dpm_* dump (ignores the "S:" line)."""
+    levels = []
+    for line in (text or "").splitlines():
+        m = _DPM_LINE_RE.match(line)
+        if m and m.group(1).isdigit():
+            levels.append(int(m.group(2)))
+    return levels
+
+
 def parse_dpm_clock(text: str | None) -> int | None:
     """Return the active clock (MHz) from a pp_dpm_sclk/pp_dpm_mclk dump.
 
