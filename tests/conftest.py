@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ RX7900XTX = "0000:08:00.0"
 
 @pytest.fixture
 def emu_root(tmp_path: Path, monkeypatch) -> Path:
+    random.seed(1234)  # emulator load pattern / noise: reproducible tests
     root = build_tree(tmp_path / "sysfs")
     monkeypatch.setenv("RADEONPILOT_SYSFS_ROOT", str(root))
     monkeypatch.delenv("RADEONPILOT_EMU_FAIL", raising=False)

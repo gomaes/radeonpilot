@@ -47,6 +47,9 @@ def main(out: Path) -> None:
     ctl.set_od("0000:08:00.0", {"sclk_max": 2700, "voltage_offset": -50})
     ctl.set_fan_curve("0000:08:00.0", [[40, 20], [55, 35], [70, 55], [85, 80], [95, 100]])
     ctl.set_power_cap("0000:03:00.0", 290)
+    ctl.set_power_target("0000:08:00.0", 203)  # -40 %: software limiter below the driver minimum
+    clock = [0.0]
+    ctl.limiter.clock = lambda: clock[0]
     ctl.save_profile("0000:08:00.0", "静音 + 省電力")
     ctl.set_boot_profile("0000:08:00.0", "静音 + 省電力")
     AppStore().save([
@@ -58,12 +61,23 @@ def main(out: Path) -> None:
     w = MainWindow(DaemonClient(srv.socket_path))
     w.timer.stop()
     w.daemon_timer.stop()
-    sim = Simulator(backend)
-    for _ in range(60):
-        sim.step(1.0)
-        w.refresh()
     w.resize(1040, 820)
     w.show()
+    sim = Simulator(backend)
+    import random
+
+    random.seed(3)
+    for _ in range(60):
+        sim.step(1.0)
+        clock[0] += 1.0
+        ctl.limiter.tick()
+        w.refresh()
+    for _ in range(90):  # until the 7900 XTX is in a load burst, so the limiter is visibly working
+        if (ctl.limiter_status("0000:08:00.0") or {}).get("status") == "limiting":
+            break
+        sim.step(1.0)
+        clock[0] += 1.0
+        ctl.limiter.tick()
 
     def shot(name: str) -> None:
         app.processEvents()
@@ -75,6 +89,7 @@ def main(out: Path) -> None:
     w.tabs.setCurrentIndex(1)
     page = w.tabs.currentWidget()
     page.setCurrentIndex(1)
+    w.controls[1].refresh()
     shot("control.png")
     w.tabs.setCurrentIndex(2)
     w.launcher.table.selectRow(0)

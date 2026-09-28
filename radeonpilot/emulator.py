@@ -50,6 +50,7 @@ SPECS = {
         "power_max": 334,
         "power_idle": 14,
         "power_attr": "power1_input",
+        "runtime_pm": False,  # drives the display: never runtime-suspends
         "fan_max_rpm": 3300,
         "hwmon": 2,
         "od_defaults": {"sclk_offset": 0, "mclk_min": 97, "mclk_max": 1258, "voltage_offset": 0},
@@ -74,6 +75,7 @@ SPECS = {
         "power_max": 390,
         "power_idle": 22,
         "power_attr": "power1_average",
+        "runtime_pm": True,  # secondary card: suspends after 5 s idle
         "fan_max_rpm": 3200,
         "hwmon": 3,
         "od_defaults": {"sclk_min": 500, "sclk_max": 2500, "mclk_min": 97, "mclk_max": 1250, "voltage_offset": 0},
@@ -172,6 +174,7 @@ def build_tree(root: Path, gpus=("9070xt", "7900xtx"), od_enabled: bool = True) 
         _symlink(driver, dev / "driver")
         _write(dev / "mem_info_vram_total", f"{spec['vram']}\n")
         _write(dev / ATTR_PERF_LEVEL, "auto\n")
+        _write(dev / "power/runtime_status", "active\n")
         _write(hw / "name", "amdgpu\n")
         _write(hw / "power1_cap", f"{spec['power_default'] * 1_000_000}\n")
         _write(hw / "power1_cap_default", f"{spec['power_default'] * 1_000_000}\n")
@@ -190,7 +193,8 @@ def build_tree(root: Path, gpus=("9070xt", "7900xtx"), od_enabled: bool = True) 
             "od_active": dict(spec["od_defaults"]),
             "fan": copy.deepcopy(spec["fan_default"]),
             "fan_active": copy.deepcopy(spec["fan_default"]),
-            "sim": {"t": random.random() * 100, "junction": 38.0, "edge": 33.0, "mem": 40.0},
+            "sim": {"t": random.random() * 100, "junction": 38.0, "edge": 33.0, "mem": 40.0,
+                    "idle_s": 0.0, "asleep": False},
         }
         state["gpus"][key] = gpu_state
         if od_enabled:
@@ -248,6 +252,7 @@ class EmulatedBackend:
             state = self._state["gpus"][key]
             attr = path.name
             tokens = text.split()
+            self._set_awake(spec, state)  # the kernel resumes the device for a write
             self.writes.append((attr, text.strip()))
             if attr in self.fail or (tokens and f"{attr}:{tokens[0]}" in self.fail):
                 raise OSError(errno.EIO, "Input/output error (injected by emulator)")
@@ -268,6 +273,19 @@ class EmulatedBackend:
             else:
                 raise OSError(errno.EACCES, f"attribute {attr} is not writable in the emulator")
             self._render(spec, state)
+            self._save()
+
+    def _set_awake(self, spec, state) -> None:
+        state["sim"]["idle_s"] = 0.0
+        if state["sim"].get("asleep"):
+            state["sim"]["asleep"] = False
+            _write(device_dir(self.root, spec) / "power/runtime_status", "active\n")
+
+    def wake(self, gpu) -> None:
+        """Equivalent of opening the render node: resume and restart the autosuspend timer."""
+        with self.lock:
+            key, spec = self._gpu_for(gpu.device_path / "device")
+            self._set_awake(spec, self._state["gpus"][key])
             self._save()
 
     @staticmethod
@@ -411,6 +429,14 @@ class Simulator:
         sim = state["sim"]
         sim["t"] += dt
         load = _load_pattern(key, sim["t"])
+        if spec.get("runtime_pm"):
+            sim["idle_s"] = sim.get("idle_s", 0.0) + dt if load < 0.1 else 0.0
+            asleep = sim["idle_s"] > 5.0
+            if asleep != sim.get("asleep", False):
+                sim["asleep"] = asleep
+                _write(dev / "power/runtime_status", "suspended\n" if asleep else "active\n")
+            if asleep:
+                return  # a suspended GPU does not update anything
         od = state["od_active"]
         level = state["perf_level"]
 
@@ -432,12 +458,13 @@ class Simulator:
             mclk = m_levels[0]
 
         idle = spec["power_idle"]
-        scale = (sclk / spec["sclk_boost"]) * (1 + od.get("voltage_offset", 0) / 600)
+        # Dynamic power grows much faster than linearly with clock (voltage rises too).
+        scale = (sclk / spec["sclk_boost"]) ** 2.2 * (1 + od.get("voltage_offset", 0) / 600)
         demand = idle + load * (spec["power_default"] * 1.15 - idle) * scale
         cap = state["power_cap_uw"] / 1_000_000
         power = min(demand, cap)
         if demand > cap:  # power limited: clocks drop
-            sclk = s_min + (sclk - s_min) * (cap - idle) / max(demand - idle, 1)
+            sclk = s_min + (sclk - s_min) * ((cap - idle) / max(demand - idle, 1)) ** (1 / 2.2)
         power += random.uniform(-2, 2)
 
         # Fan: custom curve (hotspot based) or the firmware's own curve with zero-RPM.

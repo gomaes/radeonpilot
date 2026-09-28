@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from ..control import WRITABLE_ATTRS
+from ..sysfs import GpuInfo, wake
 
 log = logging.getLogger(__name__)
 
@@ -26,3 +27,6 @@ class SysfsBackend:
         log.info("write %s <- %r", resolved, text)
         with open(resolved, "w") as fh:
             fh.write(text + "\n")
+
+    def wake(self, gpu: GpuInfo) -> None:
+        wake(gpu)

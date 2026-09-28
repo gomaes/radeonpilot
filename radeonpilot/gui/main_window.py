@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget
 
 from .. import __version__
 from ..protocol import DaemonClient
-from ..sysfs import discover_gpus, read_stats
+from ..sysfs import discover_gpus, is_asleep, read_stats
 from .control_tab import ControlTab
 from .launcher_tab import LauncherTab
 from .monitor_tab import MonitorTab
@@ -31,6 +31,7 @@ class MainWindow(QMainWindow):
         self.gpus = discover_gpus()
         self.monitors: list[MonitorTab] = []
         self.controls: list[ControlTab] = []
+        self.pages: list[QTabWidget] = []
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -52,6 +53,7 @@ class MainWindow(QMainWindow):
             page.currentChanged.connect(lambda idx, c=ctrl: c.refresh() if idx == 1 else None)
             self.monitors.append(monitor)
             self.controls.append(ctrl)
+            self.pages.append(page)
             self.tabs.addTab(page, f"{gpu.card}: {gpu.name}")
             self.tabs.setTabToolTip(self.tabs.count() - 1, f"{gpu.pci_address}  [{gpu.vk_device_select}]")
 
@@ -72,8 +74,18 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def refresh(self) -> None:
-        for tab in self.monitors:
-            tab.update_stats(read_stats(tab.gpu))
+        """Poll only what is on screen, so GPUs nobody is looking at can reach deep idle."""
+        if not self.isVisible() or self.isMinimized():
+            return
+        current = self.tabs.currentWidget()
+        for i, (gpu, monitor) in enumerate(zip(self.gpus, self.monitors)):
+            # runtime_status is a PCI attribute: reading it never touches the GPU.
+            label = f"{gpu.card}: {gpu.name}" + ("（スリープ中）" if is_asleep(gpu) else "")
+            if self.tabs.tabText(i) != label:
+                self.tabs.setTabText(i, label)
+            page = self.pages[i]
+            if page is current and page.currentWidget() is monitor:
+                monitor.update_stats(read_stats(gpu))
 
     def check_daemon(self) -> None:
         ok, err = self.client.available()

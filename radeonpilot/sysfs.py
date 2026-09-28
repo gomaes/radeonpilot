@@ -160,6 +160,7 @@ class GpuStats:
     vram_total: int | None = None
     fan_rpm: int | None = None
     temps_c: dict[str, float] = field(default_factory=dict)
+    asleep: bool = False  # runtime-suspended: nothing was read
 
     @property
     def vram_percent(self) -> float | None:
@@ -252,7 +253,59 @@ def _hwmon_temps(hwmon: Path) -> dict[str, float]:
     return temps
 
 
+# ---------------------------------------------------------------- runtime PM
+#
+# A GPU that is not driving a display can enter runtime suspend (BACO/BOCO)
+# after ~5 s without any access. Every amdgpu sysfs/hwmon read on an awake GPU
+# restarts that timer (older kernels even wake a suspended GPU to answer), so
+# code that polls must check ``power/runtime_status`` first - that attribute
+# belongs to the PCI device and reading it never touches the GPU.
+
+AUTOSUSPEND_DELAY_S = 5.0
+_ASLEEP_STATES = ("suspended", "suspending")
+
+
+def runtime_status(gpu: GpuInfo) -> str | None:
+    """active / suspended / suspending / resuming / unsupported, or None."""
+    return read_text(gpu.device_path / "power" / "runtime_status")
+
+
+def is_asleep(gpu: GpuInfo) -> bool:
+    return runtime_status(gpu) in _ASLEEP_STATES
+
+
+def render_node(gpu: GpuInfo) -> str | None:
+    """Name of the GPU's DRM render node (e.g. renderD128)."""
+    try:
+        names = sorted(p.name for p in (gpu.device_path / "drm").iterdir() if p.name.startswith("renderD"))
+    except OSError:
+        return None
+    return names[0] if names else None
+
+
+def wake(gpu: GpuInfo, timeout: float = 3.0) -> None:
+    """Resume a runtime-suspended GPU by opening its render node.
+
+    amdgpu's open() does pm_runtime_get_sync() and releases it with
+    autosuspend, so the GPU then stays up for ~5 s. Raises OSError.
+    """
+    import time
+
+    node = render_node(gpu)
+    if node is None:
+        raise OSError(f"{gpu.pci_address} の render ノードが見つかりません")
+    fd = os.open(f"/dev/dri/{node}", os.O_RDWR | os.O_CLOEXEC)
+    os.close(fd)
+    deadline = time.monotonic() + timeout
+    while is_asleep(gpu):
+        if time.monotonic() >= deadline:
+            raise OSError("GPU がスリープから復帰しません")
+        time.sleep(0.05)
+
+
 def read_stats(gpu: GpuInfo) -> GpuStats:
+    if is_asleep(gpu):
+        return GpuStats(asleep=True)
     dev = gpu.device_path
     stats = GpuStats(
         sclk_mhz=parse_dpm_clock(read_text(dev / "pp_dpm_sclk")),

@@ -311,6 +311,56 @@ def validate_power_cap(power: PowerCap | None, watts) -> int:
     return uw
 
 
+# Lowest target the software limiter accepts, as a fraction of the default power cap.
+SOFT_LIMIT_FLOOR = 0.40
+POWER_PRESETS_PCT = (-40, -30, -20, -10, 0)
+
+
+def sclk_limit_key(od: OdState | None) -> str | None:
+    """The OverDrive value the software power limiter turns down."""
+    if od is None:
+        return None
+    supported = od.supported()
+    for key in ("sclk_offset", "sclk_max"):
+        if key in supported:
+            return key
+    return None
+
+
+def soft_floor_uw(power: PowerCap) -> int | None:
+    base = power.default_uw or power.min_uw
+    return None if not base else int(base * SOFT_LIMIT_FLOOR)
+
+
+def validate_power_target(power: PowerCap | None, watts, od: OdState | None) -> tuple[int, bool]:
+    """Validate a power target. Returns (microwatts, needs_software_limiter).
+
+    Targets inside the driver range are plain power1_cap values. Targets below
+    power1_cap_min (the kernel rejects those) are only allowed when OverDrive
+    lets the software limiter lower the core clock, and never below
+    SOFT_LIMIT_FLOOR of the default. Nothing above power1_cap_max is allowed.
+    """
+    if power is None or power.max_uw is None or power.min_uw is None:
+        raise ValidationError("このGPUは電力上限の範囲（power1_cap_min/max）を報告していません")
+    if isinstance(watts, bool) or not isinstance(watts, (int, float)) or not math.isfinite(watts):
+        raise ValidationError("電力の目標値は数値で指定してください")
+    uw = int(round(watts * 1_000_000))
+    if uw > power.max_uw:
+        raise ValidationError(f"{watts:g} W はドライバの上限 {power.max_w:g} W を超えています")
+    if uw >= power.min_uw:
+        return uw, False
+    floor = soft_floor_uw(power)
+    if floor is None or uw < floor:
+        lo = "?" if floor is None else f"{floor / 1_000_000:g}"
+        raise ValidationError(f"{watts:g} W は低すぎます（ソフトウェア制限の下限: {lo} W）")
+    if sclk_limit_key(od) is None:
+        raise ValidationError(
+            f"ドライバの下限 {power.min_w:g} W 未満にするには、コアクロックを下げるための "
+            "OverDrive（amdgpu.ppfeaturemask）が必要です"
+        )
+    return uw, True
+
+
 def validate_perf_level(level) -> str:
     if level not in PERF_LEVELS:
         raise ValidationError(f"不正なパフォーマンスレベルです: {level!r}")

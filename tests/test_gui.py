@@ -52,6 +52,7 @@ def window(qapp, controller, tmp_path, monkeypatch):
     w = MainWindow(DaemonClient(srv.socket_path))
     w.timer.stop()
     w.daemon_timer.stop()
+    w.show()
     yield w
     w.close()
     srv.shutdown()
@@ -73,7 +74,7 @@ def test_tabs(window):
 def test_power_and_perf(window, controller, dialogs):
     c = ctrl_for(window, RX9070XT)
     assert c.daemon_ok and c.power_apply.isEnabled()
-    assert (c.power_spin.minimum(), c.power_spin.maximum()) == (274, 334)
+    assert (c.power_spin.minimum(), c.power_spin.maximum()) == (122, 334)  # 122 = 40 % of 304 (software limit)
     c.power_spin.setValue(290)
     c.apply_power()
     assert controller.state(RX9070XT)["power"]["current_w"] == 290
@@ -205,3 +206,68 @@ def test_launcher_tab(window, tmp_path, monkeypatch):
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
     lt.delete_app()
     assert not files[0].exists() and lt.apps == []
+
+
+def test_power_preset_minus_40_uses_software_limit(window, controller, dialogs):
+    c = ctrl_for(window, RX9070XT)
+    c.set_power_preset(-40)
+    assert c.power_spin.value() == 182 and "-40%" in c.power_pct.text()
+    c.apply_power()
+    assert "ドライバの下限 274 W" in dialogs[-1][2]  # explained before applying
+    st = controller.state(RX9070XT)
+    assert st["power"]["current_w"] == 274 and st["soft_limit"]["target_w"] == 182
+    assert "ソフトウェア制限: 目標 182 W" in c.soft_status.text()
+    c.set_power_preset(-10)
+    c.apply_power()
+    assert controller.state(RX9070XT)["soft_limit"] is None
+
+
+def test_decline_software_limit_writes_nothing(window, controller, backend, monkeypatch):
+    c = ctrl_for(window, RX7900XTX)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    backend.writes.clear()
+    c.set_power_preset(-40)
+    c.apply_power()
+    assert backend.writes == [] and controller.state(RX7900XTX)["soft_limit"] is None
+
+
+def test_asleep_gpu_is_not_read(window, backend, monkeypatch):
+    from radeonpilot import control, sysfs
+
+    c = ctrl_for(window, RX7900XTX)
+    gpu = c.gpu
+    backend._state["gpus"]["7900xtx"]["sim"]["asleep"] = True
+    (gpu.device_path / "power/runtime_status").write_text("suspended\n")
+    reads = []
+    monkeypatch.setattr(control, "read_control_state", lambda *a, **k: reads.append(1))
+    c.refresh()
+    assert reads == [] and not c.sleep_box.isHidden() and not c.od_box.isEnabled()
+    window.tabs.setCurrentIndex(1)
+    window.pages[1].setCurrentIndex(0)
+    window.refresh()
+    assert window.monitors[1].cells["sclk"].value.text() == "スリープ中"
+    assert "スリープ中" in window.tabs.tabText(1)
+    monkeypatch.undo()
+    c.wake_gpu()  # through the daemon
+    assert not sysfs.is_asleep(gpu) and c.sleep_box.isHidden() and c.od_box.isEnabled()
+
+
+def test_only_visible_gpu_is_polled(window, monkeypatch):
+    import radeonpilot.gui.main_window as mw
+    from radeonpilot.sysfs import GpuStats
+
+    polled = []
+    monkeypatch.setattr(mw, "read_stats", lambda g: polled.append(g.pci_address) or GpuStats())
+    window.tabs.setCurrentIndex(0)
+    window.pages[0].setCurrentIndex(0)
+    window.refresh()
+    assert polled == [RX9070XT]
+    window.pages[0].setCurrentIndex(1)  # control sub-tab: no monitor polling
+    window.refresh()
+    window.tabs.setCurrentIndex(2)      # launcher
+    window.refresh()
+    window.showMinimized()
+    window.tabs.setCurrentIndex(0)
+    window.pages[0].setCurrentIndex(0)
+    window.refresh()
+    assert polled == [RX9070XT]

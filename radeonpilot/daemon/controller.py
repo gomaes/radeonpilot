@@ -26,7 +26,8 @@ from ..control import (
     ControlState,
     ValidationError,
 )
-from ..sysfs import GpuInfo, discover_gpus
+from ..sysfs import GpuInfo, discover_gpus, is_asleep
+from .limiter import LimitState, SoftPowerLimiter
 from .profiles import ProfileStore
 
 log = logging.getLogger(__name__)
@@ -51,14 +52,25 @@ class Controller:
         self.root = Path(root)
         self.store = store
         self.lock = threading.RLock()
+        self.limiter = SoftPowerLimiter(self)
 
     # ------------------------------------------------------------ helpers
 
-    def _gpu(self, pci) -> GpuInfo:
+    def discover(self) -> list[GpuInfo]:
+        return discover_gpus(self.root)
+
+    def _gpu(self, pci, wake: bool = True) -> GpuInfo:
+        """Look up a GPU. With wake=True a runtime-suspended GPU is woken first,
+        because amdgpu refuses sysfs reads on a suspended device."""
         if not isinstance(pci, str):
             raise ValidationError("GPU の PCI アドレスが指定されていません")
-        for gpu in discover_gpus(self.root):
+        for gpu in self.discover():
             if gpu.pci_address == pci:
+                if wake and is_asleep(gpu):
+                    try:
+                        self.backend.wake(gpu)
+                    except OSError as exc:
+                        raise ValidationError(f"スリープ中の GPU を起こせませんでした: {exc}") from None
                 return gpu
         raise ValidationError(f"GPU {pci} が見つかりません")
 
@@ -83,6 +95,7 @@ class Controller:
         if category == "perf_level":
             self._write(gpu, ATTR_PERF_LEVEL, "auto")
         elif category == "power_cap":
+            self._stop_limiter(gpu, restore=True)
             power = self._state(gpu).power
             if power is None:
                 return
@@ -90,6 +103,7 @@ class Controller:
                 raise OSError("power1_cap_default が無いためデフォルト値が分かりません")
             self._write(gpu, ATTR_POWER_CAP, str(power.default_uw))
         elif category == "od":
+            self.limiter.drop(gpu.pci_address)  # "r" below restores the clocks anyway
             if self._state(gpu).od is None:
                 return
             # On SMU13/14 (RDNA3/4) "r" restores the defaults *and* commits them, so no
@@ -166,8 +180,27 @@ class Controller:
             for g in discover_gpus(self.root)
         ]
 
+    def limiter_status(self, pci) -> dict | None:
+        """Software limiter state. Does not touch the GPU (safe to poll)."""
+        if not isinstance(pci, str):
+            raise ValidationError("GPU の PCI アドレスが指定されていません")
+        limit = self.limiter.get(pci)
+        return limit.to_dict() if limit else None
+
+    def wake(self, pci) -> dict:
+        """Wake a runtime-suspended GPU (so the GUI can read its settings)."""
+        self._gpu(pci)
+        return {"awake": True}
+
     def state(self, pci) -> dict:
-        return self._state(self._gpu(pci)).to_dict()
+        gpu = self._gpu(pci)
+        data = self._state(gpu).to_dict()
+        limit = self.limiter.get(gpu.pci_address)
+        data["soft_limit"] = limit.to_dict() if limit else None
+        if limit and data["od"]:
+            # Show the user's own value, not the one the limiter is currently applying.
+            data["od"]["values"][limit.key] = limit.base
+        return data
 
     def set_perf_level(self, pci, level) -> dict:
         with self.lock:
@@ -180,14 +213,90 @@ class Controller:
             return self.state(pci)
 
     def set_power_cap(self, pci, watts) -> dict:
+        """Plain power1_cap inside the driver range (stops the software limiter)."""
         with self.lock:
             gpu = self._gpu(pci)
             uw = control.validate_power_cap(self._state(gpu).power, watts)
             try:
+                self._stop_limiter(gpu, restore=True)
                 self._apply_power_cap(gpu, uw)
             except OSError as exc:
                 raise self._fail(gpu, ["power_cap"], exc) from None
             return self.state(pci)
+
+    def set_power_target(self, pci, watts) -> dict:
+        """Power target; below power1_cap_min the software limiter takes over."""
+        with self.lock:
+            gpu = self._gpu(pci)
+            st = self._state(gpu)
+            uw, soft = control.validate_power_target(st.power, watts, st.od if st.od_available else None)
+            try:
+                if soft:
+                    if st.power.current_uw != st.power.min_uw:
+                        self._apply_power_cap(gpu, st.power.min_uw)
+                    self._start_limiter(gpu, uw)
+                else:
+                    self._stop_limiter(gpu, restore=True)
+                    self._apply_power_cap(gpu, uw)
+            except OSError as exc:
+                raise self._fail(gpu, ["power_cap"], exc) from None
+            return self.state(pci)
+
+    def _start_limiter(self, gpu: GpuInfo, target_uw: int) -> None:
+        od = self._state(gpu).od
+        key = control.sclk_limit_key(od)
+        if key is None:
+            raise OSError("コアクロックを制御できません")
+        rng = od.range_for(key)
+        floor = rng.lo
+        if key == "sclk_max":
+            floor = max(floor, od.values.get("sclk_min", floor))
+        old = self.limiter.get(gpu.pci_address)
+        base = old.base if old and old.key == key else od.values[key]
+        self.limiter.set(
+            gpu.pci_address,
+            LimitState(target_uw=target_uw, key=key, base=base, current=od.values[key], floor=floor),
+        )
+        log.info("%s: software power limit %.0f W (%s base %d, floor %d)",
+                 gpu.pci_address, target_uw / 1e6, key, base, floor)
+
+    def _stop_limiter(self, gpu: GpuInfo, restore: bool) -> None:
+        """Stop limiting; with restore=True give the user's clock value back."""
+        st = self.limiter.drop(gpu.pci_address)
+        if st and restore and st.current != st.base:
+            self._apply_od(gpu, {st.key: st.base})
+            log.info("%s: software power limit off, %s restored to %d", gpu.pci_address, st.key, st.base)
+
+    def shutdown(self) -> None:
+        """Daemon exit: stop limiting and give the user's clock values back."""
+        self.limiter.stop()
+        with self.lock:
+            for gpu in self.discover():
+                if self.limiter.get(gpu.pci_address) is None:
+                    continue
+                try:
+                    if is_asleep(gpu):
+                        self.backend.wake(gpu)
+                    self._stop_limiter(gpu, restore=True)
+                except OSError as exc:
+                    log.error("%s: could not restore clocks on exit: %s", gpu.pci_address, exc)
+
+    def limiter_write(self, gpu: GpuInfo, key: str, value: int) -> bool:
+        """Called by the limiter thread. Same validation/failure handling as any write."""
+        with self.lock:
+            if self.limiter.get(gpu.pci_address) is None:
+                return False  # disabled meanwhile
+            try:
+                values = control.validate_od(self._state(gpu).od, {key: value})
+                self._apply_od(gpu, values)
+                return True
+            except ValidationError as exc:
+                log.error("%s: limiter value rejected (%s); limiter stopped", gpu.pci_address, exc)
+                self._stop_limiter(gpu, restore=False)
+            except OSError as exc:
+                self.limiter.drop(gpu.pci_address)
+                self._fail(gpu, ["od"], exc)  # logs and resets clocks to default
+            return False
 
     def set_od(self, pci, values) -> dict:
         with self.lock:
@@ -200,6 +309,9 @@ class Controller:
                 self._apply_od(gpu, values)
             except OSError as exc:
                 raise self._fail(gpu, ["od"], exc) from None
+            limit = self.limiter.get(gpu.pci_address)
+            if limit and limit.key in values:
+                limit.base = limit.current = values[limit.key]
             return self.state(pci)
 
     def set_fan_curve(self, pci, points) -> dict:
@@ -248,10 +360,15 @@ class Controller:
         settings: dict = {}
         if st.perf_level in control.PERF_LEVELS:
             settings["perf_level"] = st.perf_level
-        if st.power is not None and st.power.current_uw is not None:
+        limit = self.limiter.get(gpu.pci_address)
+        if limit:
+            settings["power_target_w"] = limit.target_uw / 1_000_000
+        elif st.power is not None and st.power.current_uw is not None:
             settings["power_cap_w"] = st.power.current_uw // 1_000_000
         if st.od is not None:
             settings["od"] = {k: st.od.values[k] for k in st.od.supported()}
+            if limit:
+                settings["od"][limit.key] = limit.base
         if st.fan_curve is not None and not st.fan_curve.is_driver_default:
             settings["fan_curve"] = [list(p) for p in st.fan_curve.points]
         return settings
@@ -259,15 +376,26 @@ class Controller:
     def _validate_settings(self, gpu: GpuInfo, settings) -> dict:
         if not isinstance(settings, dict):
             raise ValidationError("プロファイルの形式が不正です")
-        unknown = set(settings) - {"perf_level", "power_cap_w", "od", "fan_curve"}
+        unknown = set(settings) - {"perf_level", "power_cap_w", "power_target_w", "od", "fan_curve"}
         if unknown:
             raise ValidationError(f"プロファイルに不明な項目があります: {', '.join(sorted(unknown))}")
         st = self._state(gpu)
         out: dict = {}
         if settings.get("perf_level") is not None:
             out["perf_level"] = control.validate_perf_level(settings["perf_level"])
+        if settings.get("power_cap_w") is not None and settings.get("power_target_w") is not None:
+            raise ValidationError("power_cap_w と power_target_w は同時に指定できません")
         if settings.get("power_cap_w") is not None:
             out["power_cap_uw"] = control.validate_power_cap(st.power, settings["power_cap_w"])
+        if settings.get("power_target_w") is not None:
+            uw, soft = control.validate_power_target(
+                st.power, settings["power_target_w"], st.od if st.od_available else None
+            )
+            if soft:
+                out["power_cap_uw"] = st.power.min_uw
+                out["soft_target_uw"] = uw
+            else:
+                out["power_cap_uw"] = uw
         if settings.get("od") or settings.get("fan_curve"):
             if not st.od_available:
                 raise ValidationError(
@@ -283,6 +411,7 @@ class Controller:
     def apply_settings(self, gpu: GpuInfo, settings) -> None:
         with self.lock:
             valid = self._validate_settings(gpu, settings)  # all-or-nothing validation
+            self._stop_limiter(gpu, restore=False)  # the profile sets the clocks itself
             applied: list[str] = []
             steps = (
                 ("perf_level", "perf_level", self._apply_perf_level),
@@ -299,9 +428,14 @@ class Controller:
                 except OSError as exc:
                     # Leave the GPU in a known state: everything this profile touched goes back to default.
                     raise self._fail(gpu, applied, exc) from None
+            if "soft_target_uw" in valid:
+                try:
+                    self._start_limiter(gpu, valid["soft_target_uw"])
+                except OSError as exc:
+                    raise self._fail(gpu, applied, exc) from None
 
     def list_profiles(self, pci) -> dict:
-        gpu = self._gpu(pci)
+        gpu = self._gpu(pci, wake=False)
         entry = self.store.load()["gpus"].get(gpu.pci_address, {})
         return {
             "profiles": entry.get("profiles", {}),
@@ -327,7 +461,7 @@ class Controller:
 
     def delete_profile(self, pci, name) -> dict:
         with self.lock:
-            gpu = self._gpu(pci)
+            gpu = self._gpu(pci, wake=False)
             data = self.store.load()
             entry = data["gpus"].get(gpu.pci_address)
             if not entry or name not in entry.get("profiles", {}):
@@ -340,7 +474,7 @@ class Controller:
 
     def set_boot_profile(self, pci, name) -> dict:
         with self.lock:
-            gpu = self._gpu(pci)
+            gpu = self._gpu(pci, wake=False)
             data = self.store.load()
             entry = self.store.gpu_entry(data, gpu.pci_address, gpu.vk_device_select)
             if name is not None and name not in entry["profiles"]:

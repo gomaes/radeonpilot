@@ -30,6 +30,9 @@ COMMANDS = {
     "state": lambda c, p: c.state(*_params(p, "gpu")),
     "set_perf_level": lambda c, p: c.set_perf_level(*_params(p, "gpu", "level")),
     "set_power_cap": lambda c, p: c.set_power_cap(*_params(p, "gpu", "watts")),
+    "set_power_target": lambda c, p: c.set_power_target(*_params(p, "gpu", "watts")),
+    "wake": lambda c, p: c.wake(*_params(p, "gpu")),
+    "limiter_status": lambda c, p: c.limiter_status(*_params(p, "gpu")),
     "set_od": lambda c, p: c.set_od(*_params(p, "gpu", "values")),
     "reset_od": lambda c, p: c.reset_od(*_params(p, "gpu")),
     "set_fan_curve": lambda c, p: c.set_fan_curve(*_params(p, "gpu", "points")),
@@ -125,7 +128,7 @@ class DaemonServer(socketserver.ThreadingUnixStreamServer):
             return {"id": req_id, "ok": False, "kind": "validation", "error": str(exc)}
         except ValueError:
             return {"id": req_id, "ok": False, "kind": "validation", "error": "JSON を解釈できません"}
-        if cmd not in ("ping", "gpus", "state", "list_profiles"):
+        if cmd not in ("ping", "gpus", "state", "list_profiles", "limiter_status"):
             log.info("uid %d: %s %s", uid, cmd, json.dumps(params, ensure_ascii=False))
         try:
             return {"id": req_id, "ok": True, "result": COMMANDS[cmd](self.controller, params)}

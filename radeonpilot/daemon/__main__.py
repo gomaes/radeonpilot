@@ -81,11 +81,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_boot_apply:
         threading.Thread(target=controller.apply_boot_profiles, name="boot-apply", daemon=True).start()
 
+    controller.limiter.start()
     log.info("radeonpilot-daemon %s listening on %s", __version__, args.socket)
     try:
         server.serve_forever()
     finally:
         server.server_close()
+        controller.shutdown()
         if sim:
             sim.stop()
     return 0

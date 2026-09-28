@@ -74,6 +74,10 @@ class MonitorTab(QWidget):
         )
         header.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(header)
+        self.power_state = QLabel()
+        self.power_state.setWordWrap(True)
+        self.power_state.setStyleSheet("color: palette(mid);")
+        root.addWidget(self.power_state)
 
         values = QGroupBox("現在値")
         grid = QGridLayout(values)
@@ -119,6 +123,19 @@ class MonitorTab(QWidget):
         root.addLayout(graphs, 1)
 
     def update_stats(self, s: GpuStats) -> None:
+        if s.asleep:
+            self.power_state.setText(
+                "💤 省電力スリープ中（runtime suspend）。スリープを妨げないよう、GPU からは何も読み取っていません。"
+            )
+            for cell in self.cells.values():
+                cell.set("スリープ中")
+            for graph in (self.g_clock, self.g_power, self.g_load, self.g_temp, self.g_fan):
+                graph.push({})
+            return
+        self.power_state.setText(
+            "監視中は 1 秒ごとの読み取りでこの GPU が省電力スリープに入れません。"
+            "他のタブに切り替えるかウィンドウを最小化すると読み取りを止めます。"
+        )
         self.cells["sclk"].set(_fmt(s.sclk_mhz, "d", "MHz"))
         self.cells["mclk"].set(_fmt(s.mclk_mhz, "d", "MHz"))
         power = _fmt(s.power_w, ".1f", "W")
