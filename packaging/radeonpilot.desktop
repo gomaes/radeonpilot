@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RadeonPilot
+GenericName=GPU Manager
+GenericName[ja]=GPU 管理
+Comment=Monitor and tune AMD Radeon RDNA3/RDNA4 GPUs
+Comment[ja]=AMD Radeon RDNA3/RDNA4 GPU の監視と調整
+Exec=/usr/local/bin/radeonpilot
+Icon=radeonpilot
+Terminal=false
+Categories=System;Settings;
+Keywords=GPU;AMD;Radeon;amdgpu;overclock;fan;power;
