@@ -6,8 +6,13 @@ measured power is above the target, and gives them back when there is
 headroom. Two stages:
 
 1. core clock ceiling (RDNA3: OD sclk_max, RDNA4: OD sclk_offset) - always;
-2. memory clock ceiling (OD mclk_max, stepping through the real DPM levels) -
-   only if the user opted in, and only once the core is at its floor.
+2. base-clock pin (power_dpm_force_performance_level = profile_standard) -
+   only if the user opted in, only once the core is at its floor, and only
+   while the GPU is under load. This level pins GFX to the board's base clock
+   but also pins FCLK/SoC clock to their minimum and turns off GFX deep sleep,
+   ULV and GPO, so it is released as soon as the GPU goes idle;
+3. memory clock ceiling (OD mclk_max, stepping through the real DPM levels) -
+   only if the user opted in, and only once the earlier stages are exhausted.
 
 Clocks are given back in reverse order (memory first).
 
@@ -51,6 +56,9 @@ MAX_STEP_MHZ = 200
 MEM_UNDER = 0.82
 MEM_HOLD_S = 10.0
 MEM_KEY = "mclk_max"
+PERF_KEY = "power_dpm_force_performance_level"
+PIN_LEVEL = "profile_standard"
+PIN_HOLD_S = 15.0
 
 
 @dataclass
@@ -70,6 +78,12 @@ class LimitState:
     mem_base: int = 0
     mem_current: int = 0
     mem_lowered_at: float = float("-inf")
+    # Base-clock pin stage (None = not allowed).
+    pin_base_level: str | None = None  # the user's performance level, restored on release
+    pinned: bool = False
+    pinned_at: float = float("-inf")
+    pin_ratio: float = 1.0  # power just before pinning / power while pinned (headroom estimate)
+    power_before_pin: float | None = None
 
     @property
     def mem_floor(self) -> int | None:
@@ -86,7 +100,11 @@ class LimitState:
             "last_power_w": self.last_power_w,
             # Every allowed stage is at its floor: nothing more can be lowered.
             "at_floor": self.current <= self.floor
+            and (self.pin_base_level is None or self.pinned)
             and (self.mem_levels is None or self.mem_current <= self.mem_floor),
+            "base_clock_pin": None
+            if self.pin_base_level is None
+            else {"active": self.pinned, "restore_level": self.pin_base_level},
             "memory": None
             if self.mem_levels is None
             else {"base": self.mem_base, "current": self.mem_current, "floor": self.mem_floor},
@@ -121,12 +139,14 @@ def next_value(st: LimitState, power_w: float, busy_percent: int = 100) -> int:
     return st.current
 
 
-def decide(st: LimitState, power_w: float, busy_percent: int, now: float) -> tuple[str, int] | None:
-    """Pick the next (OD key, value) to write, or None."""
+def decide(st: LimitState, power_w: float, busy_percent: int, now: float) -> tuple[str, int | str] | None:
+    """Pick the next (key, value) to write, or None. key is an OD key or PERF_KEY."""
     target_w = st.target_uw / 1_000_000
     if power_w > target_w * OVER:
         if st.current > st.floor:
             return st.key, next_value(st, power_w, busy_percent)
+        if st.pin_base_level is not None and not st.pinned:
+            return PERF_KEY, PIN_LEVEL
         if st.mem_levels and st.mem_current > st.mem_floor:
             lower = [lv for lv in st.mem_levels if lv < st.mem_current]
             return MEM_KEY, lower[-1]
@@ -138,6 +158,11 @@ def decide(st: LimitState, power_w: float, busy_percent: int, now: float) -> tup
         if power_w < target_w * MEM_UNDER and now - st.mem_lowered_at >= MEM_HOLD_S:
             higher = [lv for lv in st.mem_levels if lv > st.mem_current]
             return MEM_KEY, higher[0]
+        return None
+    if st.pinned:
+        # Release only if the unpinned power (estimated) would fit, after a hold time.
+        if power_w * st.pin_ratio < target_w * UNDER and now - st.pinned_at >= PIN_HOLD_S:
+            return PERF_KEY, st.pin_base_level
         return None
     new = next_value(st, power_w, busy_percent)
     return (st.key, new) if new != st.current else None
@@ -213,6 +238,10 @@ class SoftPowerLimiter:
             st.next_sample = now + IDLE_SAMPLE_S
             return
         if busy < IDLE_BUSY_PERCENT and power <= target_w:
+            if st.pinned:
+                # The one write allowed at idle: leave profile_standard so GFX deep
+                # sleep / ULV / GPO and the normal idle clocks come back.
+                self._write(gpu, st, PERF_KEY, st.pin_base_level, power, now)
             # Idle: never write, and back off so the GPU can autosuspend.
             st.idle_samples += 1
             st.status = "idle"
@@ -220,15 +249,29 @@ class SoftPowerLimiter:
             return
         st.idle_samples = 0
         st.next_sample = now + TICK_S
+        if st.pinned and st.power_before_pin and now - st.pinned_at >= 2 * TICK_S:
+            st.pin_ratio = max(1.0, st.power_before_pin / max(power, 1.0))
+            st.power_before_pin = None
         step = decide(st, power, busy, now)
         over = power > target_w * OVER
-        lowered = st.current < st.base or (st.mem_levels is not None and st.mem_current < st.mem_base)
+        lowered = st.current < st.base or st.pinned or (st.mem_levels is not None and st.mem_current < st.mem_base)
         st.status = "floor" if over and step is None else ("limiting" if lowered or over else "ok")
         if step is None or now - st.last_write < MIN_WRITE_INTERVAL_S:
             return
         key, value = step
-        old = st.mem_current if key == MEM_KEY else st.current
-        log.debug("%s: %.0f W (target %.0f W): %s %d -> %d", gpu.pci_address, power, target_w, key, old, value)
+        log.debug("%s: %.0f W (target %.0f W): %s -> %s", gpu.pci_address, power, target_w, key, value)
+        self._write(gpu, st, key, value, power, now)
+
+    def _write(self, gpu: GpuInfo, st: LimitState, key: str, value, power: float, now: float) -> None:
+        if key == PERF_KEY:
+            if not self.controller.limiter_set_perf(gpu, value):
+                return
+            st.pinned = value == PIN_LEVEL
+            if st.pinned:
+                st.pinned_at = now
+                st.power_before_pin = power
+            st.last_write = now
+            return
         if self.controller.limiter_write(gpu, key, value):
             if key == MEM_KEY:
                 if value < st.mem_current:

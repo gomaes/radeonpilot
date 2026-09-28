@@ -27,7 +27,7 @@ from ..control import (
     ValidationError,
 )
 from ..sysfs import GpuInfo, discover_gpus, is_asleep, parse_dpm_levels, read_text
-from .limiter import MEM_KEY, LimitState, SoftPowerLimiter, memory_levels
+from .limiter import MEM_KEY, PIN_LEVEL, LimitState, SoftPowerLimiter, memory_levels
 from .profiles import ProfileStore
 
 log = logging.getLogger(__name__)
@@ -93,6 +93,9 @@ class Controller:
     def _reset_category(self, gpu: GpuInfo, category: str) -> None:
         """Restore one category to the driver default. Raises OSError on failure."""
         if category == "perf_level":
+            limit = self.limiter.get(gpu.pci_address)
+            if limit and limit.pin_base_level is not None:
+                limit.pinned, limit.pin_base_level = False, "auto"
             self._write(gpu, ATTR_PERF_LEVEL, "auto")
         elif category == "power_cap":
             self._stop_limiter(gpu, restore=True)
@@ -202,12 +205,22 @@ class Controller:
             data["od"]["values"][limit.key] = limit.base
             if limit.mem_levels is not None:
                 data["od"]["values"][MEM_KEY] = limit.mem_base
+        if limit and limit.pin_base_level is not None:
+            data["perf_level"] = limit.pin_base_level  # the user's level, not the temporary pin
         return data
 
     def set_perf_level(self, pci, level) -> dict:
         with self.lock:
             gpu = self._gpu(pci)
             level = control.validate_perf_level(level)
+            limit = self.limiter.get(gpu.pci_address)
+            if limit and limit.pin_base_level is not None:
+                if level.startswith("profile_"):
+                    raise ValidationError(
+                        "ベースクロック固定が有効な間は profile_* レベルを指定できません（電力目標の設定で無効にしてください）"
+                    )
+                limit.pin_base_level = level
+                limit.pinned = False
             try:
                 self._apply_perf_level(gpu, level)
             except OSError as exc:
@@ -226,25 +239,33 @@ class Controller:
                 raise self._fail(gpu, ["power_cap"], exc) from None
             return self.state(pci)
 
-    def set_power_target(self, pci, watts, allow_memory=False) -> dict:
+    def set_power_target(self, pci, watts, allow_memory=False, allow_base_clock=False) -> dict:
         """Power target; below power1_cap_min the software limiter takes over.
 
-        allow_memory: let the limiter also lower the memory clock once the core
-        clock is at its floor (off by default: memory stays at the user's value).
+        allow_base_clock: once the core clock is at its floor, pin GFX to the base
+        clock (profile_standard) while the GPU is under load. Off by default.
+        allow_memory: as a last stage also lower the memory clock. Off by default:
+        memory stays at the user's value.
         """
-        if allow_memory is None:
-            allow_memory = False
-        if not isinstance(allow_memory, bool):
-            raise ValidationError("allow_memory は true/false で指定してください")
+        allow_memory = False if allow_memory is None else allow_memory
+        allow_base_clock = False if allow_base_clock is None else allow_base_clock
+        if not isinstance(allow_memory, bool) or not isinstance(allow_base_clock, bool):
+            raise ValidationError("allow_memory / allow_base_clock は true/false で指定してください")
         with self.lock:
             gpu = self._gpu(pci)
             st = self._state(gpu)
             uw, soft = control.validate_power_target(st.power, watts, st.od if st.od_available else None)
+            old = self.limiter.get(gpu.pci_address)
+            level = old.pin_base_level if old and old.pin_base_level else st.perf_level
+            if soft and allow_base_clock and (level not in control.PERF_LEVELS or level.startswith("profile_")):
+                raise ValidationError(
+                    f"パフォーマンスレベルが {level!r} のため、ベースクロック固定は使えません（auto などにしてください）"
+                )
             try:
                 if soft:
                     if st.power.current_uw != st.power.min_uw:
                         self._apply_power_cap(gpu, st.power.min_uw)
-                    self._start_limiter(gpu, uw, allow_memory)
+                    self._start_limiter(gpu, uw, allow_memory, allow_base_clock)
                 else:
                     self._stop_limiter(gpu, restore=True)
                     self._apply_power_cap(gpu, uw)
@@ -252,8 +273,10 @@ class Controller:
                 raise self._fail(gpu, ["power_cap"], exc) from None
             return self.state(pci)
 
-    def _start_limiter(self, gpu: GpuInfo, target_uw: int, allow_memory: bool = False) -> None:
-        od = self._state(gpu).od
+    def _start_limiter(self, gpu: GpuInfo, target_uw: int, allow_memory: bool = False,
+                       allow_base_clock: bool = False) -> None:
+        cs = self._state(gpu)
+        od = cs.od
         key = control.sclk_limit_key(od)
         if key is None:
             raise OSError("コアクロックを制御できません")
@@ -275,10 +298,23 @@ class Controller:
             state.mem_levels = memory_levels(levels, mem_base, od.values.get("mclk_min"))
             state.mem_base = mem_base
             state.mem_current = od.values[MEM_KEY]
+        old_pin_level = old.pin_base_level if old else None
+        user_level = old_pin_level or cs.perf_level
+        if old and old.pinned and not allow_base_clock:
+            self._apply_perf_level(gpu, old_pin_level)  # stage switched off: release the pin
+        if allow_base_clock:
+            if user_level not in control.PERF_LEVELS or user_level.startswith("profile_"):
+                raise OSError(
+                    f"パフォーマンスレベルが {user_level!r} のため、ベースクロック固定は使えません（auto にしてください）"
+                )
+            state.pin_base_level = user_level
+            if old and old.pinned:
+                state.pinned, state.pinned_at, state.pin_ratio = True, old.pinned_at, old.pin_ratio
         self.limiter.set(gpu.pci_address, state)
         log.info("%s: software power limit %.0f W (%s base %d, floor %d; memory stage %s)",
                  gpu.pci_address, target_uw / 1e6, key, base, floor,
                  state.mem_levels if allow_memory else "off")
+        log.info("%s: base clock pin stage %s", gpu.pci_address, "on" if allow_base_clock else "off")
 
     def _stop_limiter(self, gpu: GpuInfo, restore: bool) -> None:
         """Stop limiting; with restore=True give the user's clock value back."""
@@ -293,6 +329,9 @@ class Controller:
         if values:
             self._apply_od(gpu, values)
             log.info("%s: software power limit off, restored %s", gpu.pci_address, values)
+        if st.pinned:
+            self._apply_perf_level(gpu, st.pin_base_level)
+            log.info("%s: base clock pin released (%s)", gpu.pci_address, st.pin_base_level)
 
     def shutdown(self) -> None:
         """Daemon exit: stop limiting and give the user's clock values back."""
@@ -307,6 +346,20 @@ class Controller:
                     self._stop_limiter(gpu, restore=True)
                 except OSError as exc:
                     log.error("%s: could not restore clocks on exit: %s", gpu.pci_address, exc)
+
+    def limiter_set_perf(self, gpu: GpuInfo, level: str) -> bool:
+        """Limiter thread: enter/leave the base-clock pin."""
+        with self.lock:
+            limit = self.limiter.get(gpu.pci_address)
+            if limit is None or limit.pin_base_level is None or level not in (PIN_LEVEL, limit.pin_base_level):
+                return False
+            try:
+                self._apply_perf_level(gpu, level)
+                return True
+            except OSError as exc:
+                self.limiter.drop(gpu.pci_address)
+                self._fail(gpu, ["perf_level"], exc)  # logs and resets to auto
+                return False
 
     def limiter_write(self, gpu: GpuInfo, key: str, value: int) -> bool:
         """Called by the limiter thread. Same validation/failure handling as any write."""
@@ -396,6 +449,9 @@ class Controller:
             settings["power_target_w"] = limit.target_uw / 1_000_000
             if limit.mem_levels is not None:
                 settings["power_target_allow_memory"] = True
+            if limit.pin_base_level is not None:
+                settings["power_target_allow_base_clock"] = True
+                settings["perf_level"] = limit.pin_base_level
         elif st.power is not None and st.power.current_uw is not None:
             settings["power_cap_w"] = st.power.current_uw // 1_000_000
         if st.od is not None:
@@ -412,7 +468,8 @@ class Controller:
         if not isinstance(settings, dict):
             raise ValidationError("プロファイルの形式が不正です")
         unknown = set(settings) - {
-            "perf_level", "power_cap_w", "power_target_w", "power_target_allow_memory", "od", "fan_curve",
+            "perf_level", "power_cap_w", "power_target_w", "power_target_allow_memory",
+            "power_target_allow_base_clock", "od", "fan_curve",
         }
         if unknown:
             raise ValidationError(f"プロファイルに不明な項目があります: {', '.join(sorted(unknown))}")
@@ -431,10 +488,12 @@ class Controller:
             if soft:
                 out["power_cap_uw"] = st.power.min_uw
                 out["soft_target_uw"] = uw
-                allow = settings.get("power_target_allow_memory", False)
-                if not isinstance(allow, bool):
-                    raise ValidationError("power_target_allow_memory は true/false で指定してください")
-                out["soft_allow_memory"] = allow
+                for name in ("power_target_allow_memory", "power_target_allow_base_clock"):
+                    allow = settings.get(name, False)
+                    if not isinstance(allow, bool):
+                        raise ValidationError(f"{name} は true/false で指定してください")
+                out["soft_allow_memory"] = settings.get("power_target_allow_memory", False)
+                out["soft_allow_base_clock"] = settings.get("power_target_allow_base_clock", False)
             else:
                 out["power_cap_uw"] = uw
         if settings.get("od") or settings.get("fan_curve"):
@@ -471,7 +530,8 @@ class Controller:
                     raise self._fail(gpu, applied, exc) from None
             if "soft_target_uw" in valid:
                 try:
-                    self._start_limiter(gpu, valid["soft_target_uw"], valid["soft_allow_memory"])
+                    self._start_limiter(gpu, valid["soft_target_uw"], valid["soft_allow_memory"],
+                                        valid["soft_allow_base_clock"])
                 except OSError as exc:
                     raise self._fail(gpu, applied, exc) from None
 

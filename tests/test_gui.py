@@ -285,3 +285,35 @@ def test_memory_stage_checkbox(window, controller, dialogs):
     assert "メモリクロック上限も" in dialogs[-1][2]
     assert controller.state(RX9070XT)["soft_limit"]["memory"]["floor"] == 456
     assert c.mem_stage_check.isChecked()  # reflects the daemon state after refresh
+
+
+def test_base_clock_pin_checkbox(window, controller, dialogs):
+    c = ctrl_for(window, RX9070XT)
+    assert not c.pin_stage_check.isChecked() and c.pin_stage_check.isEnabled()
+    c.power_spin.setValue(150)
+    c.apply_power()
+    assert "ベースクロック固定は使いません" in dialogs[-1][2]
+    assert controller.state(RX9070XT)["soft_limit"]["base_clock_pin"] is None
+    c.pin_stage_check.setChecked(True)
+    c.apply_power()
+    assert "profile_standard" in dialogs[-1][2]
+    assert controller.state(RX9070XT)["soft_limit"]["base_clock_pin"] == {"active": False, "restore_level": "auto"}
+    assert c.pin_stage_check.isChecked()
+    c.pin_stage_check.setChecked(False)  # switch it off again
+    c.apply_power()
+    assert controller.state(RX9070XT)["soft_limit"]["base_clock_pin"] is None
+
+
+def test_perf_combo_shows_user_level_while_pinned(window, controller, backend):
+    c = ctrl_for(window, RX9070XT)
+    controller.set_power_target(RX9070XT, 150, allow_base_clock=True)
+    lim = controller.limiter.get(RX9070XT)
+    gpu = c.gpu
+    lim.current = lim.floor
+    (gpu.device_path / "gpu_busy_percent").write_text("95\n")
+    (gpu.hwmon_path / "power1_input").write_text("220000000\n")
+    controller.limiter._sample(gpu, lim, 1e9)
+    assert (gpu.device_path / "power_dpm_force_performance_level").read_text().strip() == "profile_standard"
+    c.refresh()
+    assert c.perf_combo.currentData() == "auto"
+    assert "ベースクロック固定中" in c.soft_status.text()

@@ -44,6 +44,7 @@ SPECS = {
         "od_format": "rdna4",
         "sclk_idle": 500,
         "sclk_boost": 2970,
+        "sclk_base": 1660,  # profile_standard pins GFX here
         "mclk_levels": [96, 456, 772, 1258],
         "power_default": 304,
         "power_min": 274,
@@ -70,6 +71,7 @@ SPECS = {
         "od_format": "rdna3",
         "sclk_idle": 500,
         "sclk_boost": 2500,
+        "sclk_base": 1855,
         "mclk_levels": [97, 456, 772, 1250],
         "power_default": 339,
         "power_min": 305,
@@ -455,6 +457,8 @@ class Simulator:
         else:
             load_clk = load
         sclk = s_min + (s_max - s_min) * (load_clk ** 0.6)
+        if level == "profile_standard":
+            sclk = spec["sclk_base"]  # pinned, whatever the load
         mclk = m_levels[-1] if load > 0.15 or level in ("high", "profile_peak") else m_levels[0]
         if level in ("low", "profile_min_mclk"):
             mclk = m_levels[0]
@@ -465,6 +469,8 @@ class Simulator:
         scale = (sclk / spec["sclk_boost"]) ** 2.2 * (1 + od.get("voltage_offset", 0) / 600)
         mem_power = mem_full * (mclk / spec["mclk_levels"][-1]) * (0.3 + 0.7 * load)
         demand = idle + load * (spec["power_default"] * 1.15 - idle - mem_full) * scale + mem_power
+        if level.startswith("profile_"):
+            demand += 12  # GFX deep sleep / ULV / GPO are off in the UMD pstate levels
         cap = state["power_cap_uw"] / 1_000_000
         power = min(demand, cap)
         if demand > cap:  # power limited: clocks drop

@@ -30,7 +30,7 @@ COMMANDS = {
     "state": lambda c, p: c.state(*_params(p, "gpu")),
     "set_perf_level": lambda c, p: c.set_perf_level(*_params(p, "gpu", "level")),
     "set_power_cap": lambda c, p: c.set_power_cap(*_params(p, "gpu", "watts")),
-    "set_power_target": lambda c, p: c.set_power_target(*_params(p, "gpu", "watts", "allow_memory")),
+    "set_power_target": lambda c, p: c.set_power_target(*_params(p, "gpu", "watts", "allow_memory", "allow_base_clock")),
     "wake": lambda c, p: c.wake(*_params(p, "gpu")),
     "limiter_status": lambda c, p: c.limiter_status(*_params(p, "gpu")),
     "set_od": lambda c, p: c.set_od(*_params(p, "gpu", "values")),
